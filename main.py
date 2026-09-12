@@ -1,4 +1,3 @@
-
 import streamlit as st
 import sqlite3
 import os
@@ -11,13 +10,6 @@ import requests
 
 # ============================================================
 # 해야지 - 학교/과제 일정 관리 앱
-# 요구사항:
-# 1) 월간 캘린더 + 과제/학사일정
-# 2) 과제 상세/수정/진행률/사진/파일/링크
-# 3) 과제 등록 + 알람 + 제출/준비물 체크
-# 4) 이전 과제/구상 내용 + 분류 + 검색 + 상세 + 첨부
-# 5) SQLite 영구 저장: 새로고침/재접속 후에도 유지
-# 6) 삭제 기능 없음: 등록한 자료를 임의 삭제하지 않음
 # ============================================================
 
 st.set_page_config(
@@ -37,7 +29,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # DB
 # -----------------------------
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    # SQLite 동시성 예외 방지를 위해 check_same_thread 옵션 추가
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -119,6 +112,16 @@ def init_db():
     )
     """)
 
+    # NEIS 학교 설정 영구 보존을 위한 테이블
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS school_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        school_name TEXT NOT NULL,
+        school_code TEXT NOT NULL,
+        office_code TEXT NOT NULL
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -128,13 +131,12 @@ init_db()
 
 def migrate_task_notes():
     conn = db()
-    # 기존 DB에 과목 열이 없는 경우 추가
     try:
         conn.execute("ALTER TABLE tasks ADD COLUMN subject TEXT NOT NULL DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass
-    # 기존 버전에서 알람 특이사항만 따로 저장한 경우, 통합된 특이사항으로 옮긴다.
+        
     conn.execute("""
         UPDATE tasks
         SET notes = CASE
@@ -150,7 +152,7 @@ migrate_task_notes()
 
 
 # -----------------------------
-# Session
+# Session & Navigation
 # -----------------------------
 defaults = {
     "page": "home",
@@ -172,13 +174,37 @@ def navigate(page, task_id=None, archive_id=None):
     st.rerun()
 
 
+# -----------------------------
+# NEIS & School Config
+# -----------------------------
+def get_saved_school_config():
+    conn = db()
+    row = conn.execute("SELECT * FROM school_config WHERE id = 1").fetchone()
+    conn.close()
+    if row:
+        return {
+            "name": row["school_name"],
+            "code": row["school_code"],
+            "office": row["office_code"],
+        }
+    return None
 
-# -----------------------------
-# NEIS 학사일정 연동
-# -----------------------------
+
+def save_school_config(name, code, office):
+    conn = db()
+    conn.execute("""
+        INSERT INTO school_config (id, school_name, school_code, office_code)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            school_name=excluded.school_name,
+            school_code=excluded.school_code,
+            office_code=excluded.office_code
+    """, (name, code, office))
+    conn.commit()
+    conn.close()
+
+
 def neis_api_key():
-    # Streamlit Cloud에서는 Secrets에 NEIS_API_KEY를 넣으면 됨.
-    # 로컬에서도 환경변수 NEIS_API_KEY를 사용할 수 있음.
     try:
         return st.secrets["NEIS_API_KEY"]
     except Exception:
@@ -199,12 +225,13 @@ def neis_fetch(endpoint, params):
         r.raise_for_status()
         data = r.json()
         return data, None
+    except requests.exceptions.RequestException as e:
+        return None, f"나이스 API 네트워크 통신 오류: {e}"
     except Exception as e:
-        return None, f"나이스 API 요청 실패: {e}"
+        return None, f"나이스 API 응답 처리 중 오류 발생: {e}"
 
 
 def neis_school_search(school_name, education_office):
-    # schoolInfo API에서 학교명으로 검색
     data, err = neis_fetch(
         "schoolInfo",
         {
@@ -226,7 +253,6 @@ def neis_school_search(school_name, education_office):
 
 
 def neis_calendar(school_code, education_office, from_date, to_date):
-    # 학사일정 API: SchoolSchedule
     data, err = neis_fetch(
         "SchoolSchedule",
         {
@@ -262,7 +288,9 @@ def save_uploaded_files(uploaded_files, folder_prefix):
 
     for f in uploaded_files:
         safe_name = Path(f.name).name
-        filename = f"{uuid.uuid4().hex}_{safe_name}"
+        # 안전한 파일 저장을 위해 인코딩/파일명 변환 적용
+        unique_prefix = uuid.uuid4().hex
+        filename = f"{unique_prefix}_{safe_name}"
         path = folder / filename
         path.write_bytes(f.getbuffer())
         saved.append((safe_name, str(path)))
@@ -393,7 +421,7 @@ def school_event_map(year, month):
 
 
 # -----------------------------
-# CSS
+# CSS & Layout
 # -----------------------------
 st.markdown("""
 <style>
@@ -410,9 +438,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# -----------------------------
-# Navigation
-# -----------------------------
 def top_nav():
     c1, c2, c3 = st.columns([2.3, 1, 1])
     with c1:
@@ -428,7 +453,7 @@ def top_nav():
 
 
 # -----------------------------
-# Home
+# Home & Alarms
 # -----------------------------
 def page_home():
     st.markdown('<div class="app-title">📚 해야지</div>', unsafe_allow_html=True)
@@ -442,9 +467,6 @@ def page_home():
             navigate("calendar")
 
 
-# -----------------------------
-# Alarm banner
-# -----------------------------
 def alarm_banner():
     alarms = today_alarms()
     if not alarms:
@@ -479,7 +501,6 @@ def page_calendar():
     top_nav()
     st.title("📅 캘린더")
 
-    # 메인 화면에서 바로 추가할 수 있는 빠른 추가 영역
     st.subheader("빠르게 추가하기")
     qa1, qa2, qa3 = st.columns(3)
     with qa1:
@@ -530,8 +551,7 @@ def page_calendar():
         if st.button("🏫 실제 학사일정 설정"):
             navigate("neis_schedule")
 
-    # 저장된 NEIS 학교가 있으면 현재 월 학사일정을 실제로 가져와 캘린더에 표시
-    saved_neis = st.session_state.get("saved_neis_school")
+    saved_neis = get_saved_school_config()
     neis_month_events = {}
     if saved_neis and st.session_state.show_school:
         first_day = date(st.session_state.year, st.session_state.month, 1)
@@ -565,9 +585,6 @@ def page_calendar():
 
     cal = calendar.Calendar(firstweekday=0)
     weeks = cal.monthdayscalendar(y, m)
-
-    for name in ["월", "화", "수", "목", "금", "토", "일"]:
-        pass
 
     header = st.columns(7)
     for i, name in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
@@ -605,7 +622,6 @@ def page_calendar():
                             navigate("task_detail", task_id=t["id"])
 
                     if st.session_state.show_school:
-                        # 실제 NEIS 학사일정
                         for ne in neis_month_events.get(ds, []):
                             event_name = ne.get("EVENT_NM", "학사일정")
                             st.markdown(
@@ -613,7 +629,6 @@ def page_calendar():
                                 unsafe_allow_html=True
                             )
 
-                        # 사용자가 직접 추가한 학사일정
                         for e in events.get(ds, []):
                             st.markdown(
                                 f"<div class='school-pill'>🏫 {html.escape(e['title'][:18])}</div>",
@@ -645,7 +660,7 @@ def page_calendar():
 
 
 # -----------------------------
-# Add task
+# Add & Detail Task
 # -----------------------------
 def page_add_task():
     top_nav()
@@ -723,8 +738,6 @@ def page_add_task():
             st.error("테스크 이름을 입력해주세요.")
             return
 
-        # 시작일을 없애고 테스크 날짜 하나만 사용한다.
-        # 기존 DB 구조와의 호환을 위해 start_date에는 deadline과 같은 날짜를 저장한다.
         conn = db()
         cur = conn.cursor()
         cur.execute("""
@@ -734,7 +747,7 @@ def page_add_task():
                 alarm_enabled, alarm_days_before, alarm_time,
                 submission_checked, materials, materials_checked, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, '일반', 0, ?, ?, ?, 0, ?, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '일반', 0, ?, ?, ?, 0, ?, 0, ?)
         """, (
             name.strip(), task_type, subject, deadline.isoformat(), deadline.isoformat(),
             guide, notes, notes,
@@ -763,15 +776,14 @@ def page_add_task():
         navigate("task_detail", task_id=task_id)
 
 
-# -----------------------------
-# Task detail
-# -----------------------------
 def page_task_detail():
     top_nav()
     task = get_task(st.session_state.task_id)
 
     if task is None:
         st.error("테스크를 찾을 수 없습니다.")
+        if st.button("캘린더로 돌아가기"):
+            navigate("calendar")
         return
 
     if st.button("← 캘린더"):
@@ -857,8 +869,6 @@ def page_task_detail():
         st.write("알람 OFF")
 
     st.subheader("📎 첨부 파일 / 사진")
-
-    # 테스크 상세 화면에서도 사진/파일을 추가할 수 있음
     detail_upload = st.file_uploader(
         "이 테스크에 사진 또는 파일 추가",
         accept_multiple_files=True,
@@ -905,9 +915,6 @@ def page_task_detail():
         st.caption("첨부된 파일이 없습니다.")
 
     st.subheader("🔗 등록된 링크")
-
-    # 링크는 '캘린더에 링크를 붙이는 것'이 아니라
-    # 해당 테스크에 등록된 링크를 테스크 상세에서 클릭하여 이동하는 구조
     links = get_task_links(task["id"])
     if links:
         for i, link in enumerate(links, 1):
@@ -920,7 +927,6 @@ def page_task_detail():
     else:
         st.caption("이 테스크에 등록된 링크가 없습니다.")
 
-    # 상세 화면에서 링크도 바로 추가 가능
     new_task_link = st.text_input(
         "이 테스크에 링크 추가",
         placeholder="https://...",
@@ -947,7 +953,7 @@ def page_task_detail():
 
 
 # -----------------------------
-# Edit task
+# Edit task & School Schedule
 # -----------------------------
 def page_edit_task():
     top_nav()
@@ -1057,9 +1063,6 @@ def page_edit_task():
         navigate("task_detail", task_id=task["id"])
 
 
-# -----------------------------
-# School schedule
-# -----------------------------
 def page_add_school():
     top_nav()
     st.title("＋ 학교 학사일정 추가")
@@ -1086,10 +1089,6 @@ def page_add_school():
         navigate("calendar")
 
 
-
-# -----------------------------
-# 실제 학교 학사일정(NEIS)
-# -----------------------------
 def page_neis_schedule():
     top_nav()
     st.title("🏫 실제 학교 학사일정")
@@ -1144,8 +1143,7 @@ def page_neis_schedule():
 
     if results:
         options = {
-            f"{r.get('SCHUL_NM', '')} | {r.get('ORG_RDNMA', '')}":
-            r
+            f"{r.get('SCHUL_NM', '')} | {r.get('ORG_RDNMA', '')}": r
             for r in results
         }
         selected_label = st.selectbox(
@@ -1163,18 +1161,19 @@ def page_neis_schedule():
         )
 
         if st.button("💾 이 학교를 학사일정 학교로 저장"):
-            st.session_state["saved_neis_school"] = {
-                "name": selected.get("SCHUL_NM"),
-                "code": selected.get("SD_SCHUL_CODE"),
-                "office": st.session_state["neis_office_code"],
-            }
-            st.success("학교가 저장되었습니다.")
+            # 세션이 사라져도 저장되도록 DB에 지속 보존
+            save_school_config(
+                selected.get("SCHUL_NM"),
+                selected.get("SD_SCHUL_CODE"),
+                st.session_state["neis_office_code"]
+            )
+            st.success("학교 설정이 영구 저장되었습니다.")
 
-    saved = st.session_state.get("saved_neis_school")
+    saved = get_saved_school_config()
 
     if saved:
         st.divider()
-        st.subheader(f"📅 {saved['name']} 학사일정")
+        st.subheader(f"📅 현재 저장된 학교: {saved['name']}")
 
         y, m = st.session_state.year, st.session_state.month
         first_day = date(y, m, 1)
@@ -1196,14 +1195,14 @@ def page_neis_schedule():
                 dt = row.get("AA_YMD", "")
                 event = row.get("EVENT_NM", "")
                 content = row.get("EVENT_CNTNT", "")
-                grade = row.get("ONE_GRADE_EVENT_YN", "")
                 st.write(
                     f"🏫 **{dt} — {event}**"
                     + (f" · {content}" if content else "")
                 )
 
+
 # -----------------------------
-# Archive list
+# Archive Logic
 # -----------------------------
 def page_archive():
     top_nav()
@@ -1247,15 +1246,16 @@ def page_archive():
         st.divider()
 
 
-# -----------------------------
-# Archive detail
-# -----------------------------
 def page_archive_detail():
     top_nav()
     item = get_archive(st.session_state.archive_id)
 
+    # 파라미터 미선택/None 발생 시 즉각 리턴 처리로 안전성 확보
     if item is None:
-        navigate("archive")
+        st.error("아카이브 항목을 찾을 수 없습니다.")
+        if st.button("목록으로 돌아가기"):
+            navigate("archive")
+        return
 
     if st.button("← 이전 목록"):
         navigate("archive")
@@ -1289,9 +1289,6 @@ def page_archive_detail():
                     )
 
 
-# -----------------------------
-# Archive add
-# -----------------------------
 def page_add_archive():
     top_nav()
     st.title("＋ 이전 과제 / 구상 내용 등록")
@@ -1377,5 +1374,3 @@ elif page == "add_archive":
     page_add_archive()
 else:
     navigate("home")
-
- 
