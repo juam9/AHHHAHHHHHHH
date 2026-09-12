@@ -51,6 +51,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         task_type TEXT NOT NULL DEFAULT '일반 과제',
+        subject TEXT NOT NULL DEFAULT '',
         start_date TEXT NOT NULL,
         deadline TEXT NOT NULL,
         guide TEXT DEFAULT '',
@@ -127,6 +128,12 @@ init_db()
 
 def migrate_task_notes():
     conn = db()
+    # 기존 DB에 과목 열이 없는 경우 추가
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN subject TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 기존 버전에서 알람 특이사항만 따로 저장한 경우, 통합된 특이사항으로 옮긴다.
     conn.execute("""
         UPDATE tasks
@@ -523,8 +530,6 @@ def page_calendar():
         if st.button("🏫 실제 학사일정 설정"):
             navigate("neis_schedule")
 
-    st.caption("📌 파란색 = 테스크 / 🏫 노란색 = 학교 학사일정")
-
     # 저장된 NEIS 학교가 있으면 현재 월 학사일정을 실제로 가져와 캘린더에 표시
     saved_neis = st.session_state.get("saved_neis_school")
     neis_month_events = {}
@@ -582,40 +587,38 @@ def page_calendar():
                     continue
 
                 ds = date(y, m, day).isoformat()
-                st.markdown(
-                    f"<div class='daybox'><div class='daynum'>{day}</div>",
-                    unsafe_allow_html=True
-                )
+                with st.container(border=True):
+                    st.markdown(f"<div class='daynum'>{day}</div>", unsafe_allow_html=True)
 
-                for t in task_by_date.get(ds, []):
-                    label = f"📌 {t['name'][:16]}"
-                    if t["progress"] == 100:
-                        label = "✅ " + t["name"][:15]
+                    for t in task_by_date.get(ds, []):
+                        label = f"📌 {t['name'][:16]}"
+                        if t["progress"] == 100:
+                            label = "✅ " + t["name"][:15]
+                        if t["subject"]:
+                            label = f"[{t['subject']}] {label}"
 
-                    if st.button(
-                        label,
-                        key=f"cal_task_{t['id']}_{week_idx}_{col_idx}",
-                        use_container_width=True,
-                    ):
-                        navigate("task_detail", task_id=t["id"])
+                        if st.button(
+                            label,
+                            key=f"cal_task_{t['id']}_{week_idx}_{col_idx}",
+                            use_container_width=True,
+                        ):
+                            navigate("task_detail", task_id=t["id"])
 
-                if st.session_state.show_school:
-                    # 실제 NEIS 학사일정
-                    for ne in neis_month_events.get(ds, []):
-                        event_name = ne.get("EVENT_NM", "학사일정")
-                        st.markdown(
-                            f"<div class='school-pill'>🏫 {html.escape(event_name[:18])}</div>",
-                            unsafe_allow_html=True
-                        )
+                    if st.session_state.show_school:
+                        # 실제 NEIS 학사일정
+                        for ne in neis_month_events.get(ds, []):
+                            event_name = ne.get("EVENT_NM", "학사일정")
+                            st.markdown(
+                                f"<div class='school-pill'>🏫 {html.escape(event_name[:18])}</div>",
+                                unsafe_allow_html=True
+                            )
 
-                    # 사용자가 직접 추가한 학사일정
-                    for e in events.get(ds, []):
-                        st.markdown(
-                            f"<div class='school-pill'>🏫 {html.escape(e['title'][:18])}</div>",
-                            unsafe_allow_html=True
-                        )
-
-                st.markdown("</div>", unsafe_allow_html=True)
+                        # 사용자가 직접 추가한 학사일정
+                        for e in events.get(ds, []):
+                            st.markdown(
+                                f"<div class='school-pill'>🏫 {html.escape(e['title'][:18])}</div>",
+                                unsafe_allow_html=True
+                            )
 
     st.divider()
     st.subheader("📌 예정된 테스크")
@@ -632,7 +635,7 @@ def page_calendar():
         c1, c2, c3 = st.columns([4, 2, 1])
         with c1:
             st.write(f"**{t['name']}**")
-            st.caption(f"{t['task_type']} · 진행률 {t['progress']}%")
+            st.caption(f"{t['subject'] or '기타'} · {t['task_type']} · 진행률 {t['progress']}%")
         with c2:
             st.write(f"마감 {t['deadline']}")
         with c3:
@@ -654,6 +657,10 @@ def page_add_task():
         task_type = st.selectbox(
             "테스크 종류",
             ["수행평가", "과제", "시험 준비", "발표", "일반 과제"]
+        )
+        subject = st.text_input(
+            "과목",
+            placeholder="예: 화학, 미적분, 생명과학, 화학 탐구"
         )
 
         st.markdown("**📅 테스크 날짜**")
@@ -722,14 +729,14 @@ def page_add_task():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO tasks (
-                name, task_type, start_date, deadline, guide, notes,
+                name, task_type, subject, start_date, deadline, guide, notes,
                 special_alarm_note, duration_type, progress,
                 alarm_enabled, alarm_days_before, alarm_time,
                 submission_checked, materials, materials_checked, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, '일반', 0, ?, ?, ?, 0, ?, 0, ?)
         """, (
-            name.strip(), task_type, deadline.isoformat(), deadline.isoformat(),
+            name.strip(), task_type, subject, deadline.isoformat(), deadline.isoformat(),
             guide, notes, notes,
             int(alarm_enabled), alarm_days, alarm_time.strftime("%H:%M"),
             materials, datetime.now().isoformat()
@@ -772,17 +779,20 @@ def page_task_detail():
 
     st.title(f"📌 {task['name']}")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("마감일", task["deadline"])
     with c2:
         st.metric("진행률", f"{task['progress']}%")
     with c3:
+        st.metric("과목", task["subject"] or "기타")
+    with c4:
         st.metric("종류", task["task_type"])
 
     st.progress(task["progress"] / 100)
 
     st.subheader("📋 테스크 정보")
+    st.write(f"**과목:** {task['subject'] or '기타'}")
     st.write(f"**종류:** {task['task_type']}")
     st.write(f"**날짜:** {task['deadline']}")
 
@@ -954,6 +964,11 @@ def page_edit_task():
         types = ["수행평가", "과제", "시험 준비", "발표", "일반 과제"]
         current_type = task["task_type"] if task["task_type"] in types else "일반 과제"
         task_type = st.selectbox("테스크 종류", types, index=types.index(current_type))
+        subject = st.text_input(
+            "과목",
+            value=task["subject"] or "",
+            placeholder="예: 화학, 미적분, 생명과학, 화학 탐구"
+        )
 
         st.markdown("**📅 테스크 날짜**")
         deadline = st.date_input(
@@ -1011,12 +1026,12 @@ def page_edit_task():
         conn = db()
         conn.execute("""
             UPDATE tasks SET
-                name=?, task_type=?, start_date=?, deadline=?,
+                name=?, task_type=?, subject=?, start_date=?, deadline=?,
                 guide=?, notes=?, special_alarm_note=?, duration_type=?,
                 alarm_enabled=?, alarm_days_before=?, alarm_time=?, materials=?
             WHERE id=?
         """, (
-            name.strip(), task_type, deadline.isoformat(), deadline.isoformat(),
+            name.strip(), task_type, subject, deadline.isoformat(), deadline.isoformat(),
             guide, notes, notes,
             "일반", int(alarm_enabled), alarm_days, alarm_time.strftime("%H:%M"),
             materials, task["id"]
@@ -1363,3 +1378,4 @@ elif page == "add_archive":
 else:
     navigate("home")
 
+ 
